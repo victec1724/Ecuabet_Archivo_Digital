@@ -1,0 +1,8 @@
+msal
+requests
+pandas
+openpyxl
+xlrd
+fastapi
+uvicorn
+python-dotenv
