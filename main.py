@@ -1,6 +1,7 @@
 import io
 import os
 from typing import Any, Optional
+from urllib.parse import quote
 from zipfile import BadZipFile
 
 import msal
@@ -26,9 +27,8 @@ app = FastAPI(
 )
 
 
-class ProcessRequest(BaseModel):
-    archivo_id: str
-    nombre_archivo: str
+class EgresosRequest(BaseModel):
+    ruta_completa: str
 
 
 class FileError(BaseModel):
@@ -38,8 +38,10 @@ class FileError(BaseModel):
 
 class ProcessResponse(BaseModel):
     status: str
-    archivo_id: str
+    ruta_completa: str
+    ruta_limpia: str
     nombre_archivo: str
+    carpeta_fecha: str
     csv_generado: str
     transacciones_exportadas: int
     archivo_control: str
@@ -61,9 +63,6 @@ def get_config() -> dict[str, str]:
         "client_secret": get_required_env("GRAPH_CLIENT_SECRET"),
         "site_id": os.environ.get("GRAPH_SITE_ID") or os.environ.get("SITE_ID") or "",
         "drive_id": get_required_env("GRAPH_DRIVE_ID"),
-        "source_folder_id": get_required_env("SOURCE_FOLDER_ID"),
-        "destination_folder_id": get_required_env("DESTINATION_FOLDER_ID"),
-        "rpa_control_folder_id": get_required_env("RPA_CONTROL_FOLDER_ID"),
     }
 
 
@@ -91,51 +90,22 @@ def build_headers(access_token: str, content_type: Optional[str] = None) -> dict
     return headers
 
 
-def list_source_files(
-    access_token: str,
-    drive_id: str,
-    source_folder_id: str,
-) -> list[dict[str, Any]]:
-    print("Listando archivos origen en SharePoint...")
-    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{source_folder_id}/children"
-    files: list[dict[str, Any]] = []
-
-    while url:
-        response = requests.get(url, headers=build_headers(access_token), timeout=60)
-        response.raise_for_status()
-
-        payload = response.json()
-        for item in payload.get("value", []):
-            file_name = item.get("name", "")
-            is_control_csv = file_name.casefold().startswith(CONTROL_CSV_PREFIX.casefold())
-            if (
-                "file" in item
-                and not is_control_csv
-                and file_name.lower().endswith(SUPPORTED_EXTENSIONS)
-            ):
-                files.append(item)
-
-        url = payload.get("@odata.nextLink")
-
-    print(f"Archivos soportados encontrados: {len(files)}")
-    return files
-
-
-def build_content_url(config: dict[str, str], file_id: str) -> str:
+def build_content_url(config: dict[str, str], clean_path: str) -> str:
     drive_id = config["drive_id"]
     site_id = config.get("site_id")
-    if site_id:
-        return f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/items/{file_id}/content"
+    if not site_id:
+        raise RuntimeError("Falta GRAPH_SITE_ID o SITE_ID para descargar por ruta")
 
-    return f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{file_id}/content"
+    encoded_path = quote(clean_path, safe="/")
+    return f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/content"
 
 
-def download_file_bytes_by_id(
+def download_file_bytes_by_path(
     access_token: str,
     config: dict[str, str],
-    file_id: str,
+    clean_path: str,
 ) -> bytes:
-    url = build_content_url(config, file_id)
+    url = build_content_url(config, clean_path)
     response = requests.get(url, headers=build_headers(access_token), timeout=120)
     response.raise_for_status()
     return response.content
@@ -248,6 +218,64 @@ def sanitize_folder_name(folder_name: str) -> str:
     return sanitized_name
 
 
+def normalize_graph_path(path_value: str) -> str:
+    clean_path = path_value.strip().replace("\\", "/").strip("/")
+    prefixes = ("Documentos compartidos/", "Shared Documents/")
+
+    for prefix in prefixes:
+        if clean_path.casefold().startswith(prefix.casefold()):
+            clean_path = clean_path[len(prefix) :]
+            break
+
+    if not clean_path or "/" not in clean_path:
+        raise ValueError(
+            "ruta_completa debe incluir carpeta padre y nombre de archivo"
+        )
+
+    return clean_path
+
+
+def extract_file_name_from_path(clean_path: str) -> str:
+    file_name = clean_path.rstrip("/").split("/")[-1].strip()
+    if not file_name:
+        raise ValueError("No se pudo extraer el nombre de archivo desde ruta_completa")
+
+    return file_name
+
+
+def extract_parent_folder_from_path(clean_path: str) -> str:
+    path_parts = [part.strip() for part in clean_path.split("/") if part.strip()]
+    if len(path_parts) < 2:
+        raise ValueError("No se pudo extraer la carpeta padre desde ruta_completa")
+
+    return path_parts[-2]
+
+
+def extract_parent_path_from_path(clean_path: str) -> str:
+    path_parts = [part.strip() for part in clean_path.split("/") if part.strip()]
+    if len(path_parts) < 2:
+        raise ValueError("No se pudo extraer la ruta padre desde ruta_completa")
+
+    return "/".join(path_parts[:-1])
+
+
+def get_drive_item_by_path(
+    access_token: str,
+    config: dict[str, str],
+    clean_path: str,
+) -> dict[str, Any]:
+    drive_id = config["drive_id"]
+    site_id = config.get("site_id")
+    if not site_id:
+        raise RuntimeError("Falta GRAPH_SITE_ID o SITE_ID para resolver ruta en Graph")
+
+    encoded_path = quote(clean_path, safe="/")
+    url = f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}"
+    response = requests.get(url, headers=build_headers(access_token), timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
 def list_child_folders(
     access_token: str,
     drive_id: str,
@@ -335,24 +363,17 @@ def ensure_folder(
 def create_destination_hierarchy(
     access_token: str,
     config: dict[str, str],
-    file_base_name: str,
-    egr: str,
+    parent_folder_id: str,
+    egreso_base_name: str,
     transactions: pd.DataFrame,
 ) -> None:
     drive_id = config["drive_id"]
-    file_folder = ensure_folder(
+    egreso_folder = ensure_folder(
         access_token,
         drive_id,
-        config["destination_folder_id"],
-        file_base_name,
-        "Nivel 1 Archivo",
-    )
-    egr_folder = ensure_folder(
-        access_token,
-        drive_id,
-        file_folder["id"],
-        egr,
-        "Nivel 2 EGR",
+        parent_folder_id,
+        egreso_base_name,
+        "Nivel 2 Egreso",
     )
 
     for transaction in transactions.to_dict("records"):
@@ -360,7 +381,7 @@ def create_destination_hierarchy(
         ensure_folder(
             access_token,
             drive_id,
-            egr_folder["id"],
+            egreso_folder["id"],
             folder_name,
             "Nivel 3 Factura Comisionista",
         )
@@ -395,15 +416,18 @@ def build_control_csv_name(file_name: str) -> str:
 def upload_control_csv(
     access_token: str,
     config: dict[str, str],
+    parent_path: str,
     csv_bytes: bytes,
     csv_name: str,
 ) -> str:
     drive_id = config["drive_id"]
-    control_folder_id = config["rpa_control_folder_id"]
-    url = (
-        f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{control_folder_id}:/"
-        f"{csv_name}:/content"
-    )
+    site_id = config.get("site_id")
+    if not site_id:
+        raise RuntimeError("Falta GRAPH_SITE_ID o SITE_ID para subir CSV por ruta")
+
+    upload_path = f"{parent_path.rstrip('/')}/{csv_name}"
+    encoded_upload_path = quote(upload_path, safe="/")
+    url = f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/root:/{encoded_upload_path}:/content"
     response = requests.put(
         url,
         headers=build_headers(access_token, "text/csv"),
@@ -421,43 +445,65 @@ def upload_control_csv(
 def process_file(
     access_token: str,
     config: dict[str, str],
-    archivo_id: str,
+    clean_path: str,
     nombre_archivo: str,
+    parent_folder_id: str,
+    egreso_base_name: str,
 ) -> pd.DataFrame:
     print(f"Procesando archivo: {nombre_archivo}")
-    file_bytes = download_file_bytes_by_id(access_token, config, archivo_id)
+    file_bytes = download_file_bytes_by_path(access_token, config, clean_path)
 
     egr = extract_egr(file_bytes, nombre_archivo)
     print(f"EGR extraido: {egr}")
 
     transactions = extract_commissioner_transactions(file_bytes, nombre_archivo, egr)
-    file_base_name = sanitize_folder_name(get_file_base_name(nombre_archivo))
-    create_destination_hierarchy(access_token, config, file_base_name, egr, transactions)
+    create_destination_hierarchy(
+        access_token,
+        config,
+        parent_folder_id,
+        egreso_base_name,
+        transactions,
+    )
     return transactions
 
 
-def run_egresos_process(archivo_id: str, nombre_archivo: str) -> ProcessResponse:
+def run_egresos_process(ruta_completa: str) -> ProcessResponse:
     config = get_config()
     access_token = get_access_token(config)
+    clean_path = normalize_graph_path(ruta_completa)
+    nombre_archivo = extract_file_name_from_path(clean_path)
+    carpeta_fecha = extract_parent_folder_from_path(clean_path)
+    parent_path = extract_parent_path_from_path(clean_path)
+    parent_folder = get_drive_item_by_path(access_token, config, parent_path)
     errors: list[FileError] = []
     transactions = pd.DataFrame(columns=PAD_COLUMNS)
+    csv_name = build_control_csv_name(nombre_archivo)
+    egreso_base_name = sanitize_folder_name(get_file_base_name(nombre_archivo))
 
     try:
-        transactions = process_file(access_token, config, archivo_id, nombre_archivo)
+        transactions = process_file(
+            access_token,
+            config,
+            clean_path,
+            nombre_archivo,
+            parent_folder["id"],
+            egreso_base_name,
+        )
     except requests.HTTPError:
         raise
     except Exception as file_error:
         print(f"Error procesando {nombre_archivo}: {file_error}")
         errors.append(FileError(archivo=nombre_archivo, error=str(file_error)))
 
-    csv_name = build_control_csv_name(nombre_archivo)
     csv_bytes = build_control_csv_bytes([transactions] if not transactions.empty else [])
-    uploaded_url = upload_control_csv(access_token, config, csv_bytes, csv_name)
+    uploaded_url = upload_control_csv(access_token, config, parent_path, csv_bytes, csv_name)
 
     return ProcessResponse(
         status="ok" if not errors else "ok_con_errores",
-        archivo_id=archivo_id,
+        ruta_completa=ruta_completa,
+        ruta_limpia=clean_path,
         nombre_archivo=nombre_archivo,
+        carpeta_fecha=carpeta_fecha,
         csv_generado=csv_name,
         transacciones_exportadas=len(transactions),
         archivo_control=uploaded_url,
@@ -471,13 +517,13 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/procesar-egresos", response_model=ProcessResponse)
-def procesar_egresos(request: ProcessRequest) -> ProcessResponse:
+def procesar_egresos(request: EgresosRequest) -> ProcessResponse:
     try:
         print(
-            "Iniciando procesamiento stateless de egreso: "
-            f"{request.nombre_archivo} ({request.archivo_id})"
+            "Iniciando procesamiento por ruta de egreso: "
+            f"{request.ruta_completa}"
         )
-        return run_egresos_process(request.archivo_id, request.nombre_archivo)
+        return run_egresos_process(request.ruta_completa)
     except requests.HTTPError as http_error:
         graph_response = http_error.response
         status_code = graph_response.status_code if graph_response is not None else 500
