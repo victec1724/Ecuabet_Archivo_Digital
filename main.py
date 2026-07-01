@@ -17,8 +17,7 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SUPPORTED_EXTENSIONS = (".xls", ".xlsx", ".csv")
 PAD_COLUMNS = ["EGR", "CODIGO_PROVEEDOR", "DETALLE", "DETALLE_COMPLETO"]
-DEFAULT_BATCH_DATE = "18-06-2026"
-CONTROL_CSV_NAME = "egresos_a_procesar.csv"
+CONTROL_CSV_PREFIX = "CSV_"
 
 app = FastAPI(
     title="Ecuabet RPA SharePoint Service",
@@ -28,7 +27,8 @@ app = FastAPI(
 
 
 class ProcessRequest(BaseModel):
-    fecha_lote: Optional[str] = DEFAULT_BATCH_DATE
+    archivo_id: str
+    nombre_archivo: str
 
 
 class FileError(BaseModel):
@@ -38,9 +38,9 @@ class FileError(BaseModel):
 
 class ProcessResponse(BaseModel):
     status: str
-    fecha_lote: str
-    archivos_encontrados: int
-    archivos_procesados: int
+    archivo_id: str
+    nombre_archivo: str
+    csv_generado: str
     transacciones_exportadas: int
     archivo_control: str
     errores: list[FileError]
@@ -59,6 +59,7 @@ def get_config() -> dict[str, str]:
         "tenant_id": get_required_env("GRAPH_TENANT_ID"),
         "client_id": get_required_env("GRAPH_CLIENT_ID"),
         "client_secret": get_required_env("GRAPH_CLIENT_SECRET"),
+        "site_id": os.environ.get("GRAPH_SITE_ID") or os.environ.get("SITE_ID") or "",
         "drive_id": get_required_env("GRAPH_DRIVE_ID"),
         "source_folder_id": get_required_env("SOURCE_FOLDER_ID"),
         "destination_folder_id": get_required_env("DESTINATION_FOLDER_ID"),
@@ -106,7 +107,7 @@ def list_source_files(
         payload = response.json()
         for item in payload.get("value", []):
             file_name = item.get("name", "")
-            is_control_csv = file_name.casefold() == CONTROL_CSV_NAME.casefold()
+            is_control_csv = file_name.casefold().startswith(CONTROL_CSV_PREFIX.casefold())
             if (
                 "file" in item
                 and not is_control_csv
@@ -120,8 +121,21 @@ def list_source_files(
     return files
 
 
-def download_file_bytes(access_token: str, drive_id: str, file_id: str) -> bytes:
-    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{file_id}/content"
+def build_content_url(config: dict[str, str], file_id: str) -> str:
+    drive_id = config["drive_id"]
+    site_id = config.get("site_id")
+    if site_id:
+        return f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/items/{file_id}/content"
+
+    return f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{file_id}/content"
+
+
+def download_file_bytes_by_id(
+    access_token: str,
+    config: dict[str, str],
+    file_id: str,
+) -> bytes:
+    url = build_content_url(config, file_id)
     response = requests.get(url, headers=build_headers(access_token), timeout=120)
     response.raise_for_status()
     return response.content
@@ -321,22 +335,22 @@ def ensure_folder(
 def create_destination_hierarchy(
     access_token: str,
     config: dict[str, str],
-    batch_date: str,
+    file_base_name: str,
     egr: str,
     transactions: pd.DataFrame,
 ) -> None:
     drive_id = config["drive_id"]
-    date_folder = ensure_folder(
+    file_folder = ensure_folder(
         access_token,
         drive_id,
         config["destination_folder_id"],
-        batch_date,
-        "Nivel 1 Fecha",
+        file_base_name,
+        "Nivel 1 Archivo",
     )
     egr_folder = ensure_folder(
         access_token,
         drive_id,
-        date_folder["id"],
+        file_folder["id"],
         egr,
         "Nivel 2 EGR",
     )
@@ -364,16 +378,31 @@ def build_control_csv_bytes(transactions: list[pd.DataFrame]) -> bytes:
     return csv_stream.getvalue().encode("utf-8-sig")
 
 
+def get_file_base_name(file_name: str) -> str:
+    base_name = os.path.basename(file_name)
+    file_base_name, _ = os.path.splitext(base_name)
+    if not file_base_name:
+        raise ValueError(f"No se pudo obtener el nombre base de {file_name}")
+
+    return file_base_name
+
+
+def build_control_csv_name(file_name: str) -> str:
+    file_base_name = sanitize_folder_name(get_file_base_name(file_name))
+    return f"{CONTROL_CSV_PREFIX}{file_base_name}.csv"
+
+
 def upload_control_csv(
     access_token: str,
     config: dict[str, str],
     csv_bytes: bytes,
+    csv_name: str,
 ) -> str:
     drive_id = config["drive_id"]
     control_folder_id = config["rpa_control_folder_id"]
     url = (
         f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{control_folder_id}:/"
-        f"{CONTROL_CSV_NAME}:/content"
+        f"{csv_name}:/content"
     )
     response = requests.put(
         url,
@@ -384,7 +413,7 @@ def upload_control_csv(
     response.raise_for_status()
 
     uploaded_file = response.json()
-    web_url = uploaded_file.get("webUrl", CONTROL_CSV_NAME)
+    web_url = uploaded_file.get("webUrl", csv_name)
     print(f"CSV de control subido a SharePoint: {web_url}")
     return web_url
 
@@ -392,61 +421,45 @@ def upload_control_csv(
 def process_file(
     access_token: str,
     config: dict[str, str],
-    file_item: dict[str, Any],
-    batch_date: str,
+    archivo_id: str,
+    nombre_archivo: str,
 ) -> pd.DataFrame:
-    file_name = file_item["name"]
-    file_id = file_item["id"]
+    print(f"Procesando archivo: {nombre_archivo}")
+    file_bytes = download_file_bytes_by_id(access_token, config, archivo_id)
 
-    print(f"Procesando archivo: {file_name}")
-    file_bytes = download_file_bytes(access_token, config["drive_id"], file_id)
-
-    egr = extract_egr(file_bytes, file_name)
+    egr = extract_egr(file_bytes, nombre_archivo)
     print(f"EGR extraido: {egr}")
 
-    transactions = extract_commissioner_transactions(file_bytes, file_name, egr)
-    create_destination_hierarchy(access_token, config, batch_date, egr, transactions)
+    transactions = extract_commissioner_transactions(file_bytes, nombre_archivo, egr)
+    file_base_name = sanitize_folder_name(get_file_base_name(nombre_archivo))
+    create_destination_hierarchy(access_token, config, file_base_name, egr, transactions)
     return transactions
 
 
-def run_egresos_process(batch_date: str) -> ProcessResponse:
+def run_egresos_process(archivo_id: str, nombre_archivo: str) -> ProcessResponse:
     config = get_config()
     access_token = get_access_token(config)
-    files = list_source_files(
-        access_token,
-        config["drive_id"],
-        config["source_folder_id"],
-    )
-
-    processed_transactions: list[pd.DataFrame] = []
     errors: list[FileError] = []
-    processed_files = 0
+    transactions = pd.DataFrame(columns=PAD_COLUMNS)
 
-    for file_item in files:
-        try:
-            transactions = process_file(access_token, config, file_item, batch_date)
-            processed_files += 1
-            if not transactions.empty:
-                processed_transactions.append(transactions)
-        except Exception as file_error:
-            file_name = file_item.get("name", "archivo desconocido")
-            print(f"Error procesando {file_name}: {file_error}")
-            errors.append(FileError(archivo=file_name, error=str(file_error)))
+    try:
+        transactions = process_file(access_token, config, archivo_id, nombre_archivo)
+    except requests.HTTPError:
+        raise
+    except Exception as file_error:
+        print(f"Error procesando {nombre_archivo}: {file_error}")
+        errors.append(FileError(archivo=nombre_archivo, error=str(file_error)))
 
-    csv_bytes = build_control_csv_bytes(processed_transactions)
-    uploaded_url = upload_control_csv(access_token, config, csv_bytes)
-    total_transactions = (
-        sum(len(dataframe) for dataframe in processed_transactions)
-        if processed_transactions
-        else 0
-    )
+    csv_name = build_control_csv_name(nombre_archivo)
+    csv_bytes = build_control_csv_bytes([transactions] if not transactions.empty else [])
+    uploaded_url = upload_control_csv(access_token, config, csv_bytes, csv_name)
 
     return ProcessResponse(
         status="ok" if not errors else "ok_con_errores",
-        fecha_lote=batch_date,
-        archivos_encontrados=len(files),
-        archivos_procesados=processed_files,
-        transacciones_exportadas=total_transactions,
+        archivo_id=archivo_id,
+        nombre_archivo=nombre_archivo,
+        csv_generado=csv_name,
+        transacciones_exportadas=len(transactions),
         archivo_control=uploaded_url,
         errores=errors,
     )
@@ -460,9 +473,11 @@ def health() -> dict[str, str]:
 @app.post("/api/v1/procesar-egresos", response_model=ProcessResponse)
 def procesar_egresos(request: ProcessRequest) -> ProcessResponse:
     try:
-        batch_date = request.fecha_lote or DEFAULT_BATCH_DATE
-        print(f"Iniciando procesamiento de egresos para lote: {batch_date}")
-        return run_egresos_process(batch_date)
+        print(
+            "Iniciando procesamiento stateless de egreso: "
+            f"{request.nombre_archivo} ({request.archivo_id})"
+        )
+        return run_egresos_process(request.archivo_id, request.nombre_archivo)
     except requests.HTTPError as http_error:
         graph_response = http_error.response
         status_code = graph_response.status_code if graph_response is not None else 500
