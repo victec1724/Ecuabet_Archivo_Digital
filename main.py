@@ -158,22 +158,6 @@ def read_report_dataframe(
     raise ValueError(f"Extension no soportada para el archivo: {file_name}")
 
 
-def extract_egr(file_bytes: bytes, file_name: str) -> str:
-    dataframe = read_report_dataframe(file_bytes, file_name, nrows=2, header=None)
-    if dataframe.shape[0] < 2 or dataframe.shape[1] < 1:
-        raise ValueError(f"El archivo {file_name} no contiene la celda A2 esperada")
-
-    raw_value = str(dataframe.iloc[1, 0])
-    if ":" not in raw_value:
-        raise ValueError(f"La celda A2 del archivo {file_name} no contiene ':'")
-
-    egr = raw_value.split(":", maxsplit=1)[1].strip()
-    if not egr:
-        raise ValueError(f"No se encontro EGR valido en el archivo {file_name}")
-
-    return egr
-
-
 def read_stream_dataframe(
     stream: io.BytesIO,
     file_name: str,
@@ -542,8 +526,8 @@ def process_file(
     print(f"Procesando archivo: {nombre_archivo}")
     file_bytes = download_file_bytes_by_path(access_token, config, clean_path)
 
-    egr = extract_egr(file_bytes, nombre_archivo)
-    print(f"EGR extraido: {egr}")
+    egr = egreso_base_name
+    print(f"EGR definido desde nombre de archivo: {egr}")
 
     transactions = extract_commissioner_transactions(file_bytes, nombre_archivo, egr)
     create_destination_hierarchy(

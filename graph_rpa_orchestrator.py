@@ -1,13 +1,13 @@
-import io
 import os
 
 from datetime import datetime
 from typing import Any, Optional
-from zipfile import BadZipFile
 
 import msal
 import pandas as pd
 import requests
+
+from main import extract_commissioner_transactions as extract_transactions_intelligently
 
 
 CLIENT_ID = os.getenv("GRAPH_CLIENT_ID")
@@ -96,99 +96,14 @@ def download_file_bytes(access_token: str, file_id: str) -> bytes:
     return response.content
 
 
-def read_report_dataframe(
-    file_bytes: bytes,
-    file_name: str,
-    *,
-    nrows: Optional[int] = None,
-    header: Optional[int] = 0,
-    skiprows: Optional[int] = None,
-) -> pd.DataFrame:
-    """Lee reportes en memoria y aplica contingencia CSV para .xls mutantes."""
-    stream = io.BytesIO(file_bytes)
-    normalized_name = file_name.lower()
-
-    if normalized_name.endswith(".csv"):
-        return pd.read_csv(stream, nrows=nrows, header=header, skiprows=skiprows)
-    elif normalized_name.endswith(".xlsx"):
-        return pd.read_excel(
-            stream,
-            nrows=nrows,
-            header=header,
-            skiprows=skiprows,
-            engine="openpyxl",
-        )
-    elif normalized_name.endswith(".xls"):
-        try:
-            return pd.read_excel(stream, nrows=nrows, header=header, skiprows=skiprows)
-        except (ValueError, BadZipFile, ImportError, OSError) as excel_error:
-            print(
-                f"Lectura Excel fallo para {file_name}; "
-                f"aplicando contingencia CSV: {excel_error}"
-            )
-            stream.seek(0)
-            return pd.read_csv(
-                stream,
-                sep=",",
-                nrows=nrows,
-                header=header,
-                skiprows=skiprows,
-                on_bad_lines="skip",
-            )
-    else:
-        raise ValueError(f"Extension no soportada para el archivo: {file_name}")
-
-
 def extract_code_from_file(file_bytes: bytes, file_name: str) -> str:
-    """Extrae el codigo ubicado en A2 leyendo solo las dos primeras filas."""
-    dataframe = read_report_dataframe(file_bytes, file_name, nrows=2, header=None)
-
-    if dataframe.shape[0] < 2 or dataframe.shape[1] < 1:
-        raise ValueError(f"El archivo {file_name} no contiene la celda A2 esperada")
-
-    raw_value = str(dataframe.iloc[1, 0])
-    if ":" not in raw_value:
-        raise ValueError(f"La celda A2 del archivo {file_name} no contiene ':'")
-
-    code = raw_value.split(":", maxsplit=1)[1].strip()
+    """Obtiene el codigo EGR desde el nombre del archivo."""
+    del file_bytes
+    code = os.path.splitext(os.path.basename(file_name))[0].strip()
     if not code:
-        raise ValueError(f"No se encontro un codigo valido en el archivo {file_name}")
+        raise ValueError(f"No se pudo obtener el codigo desde el nombre: {file_name}")
 
     return code
-
-
-def extract_commissioner_transactions(file_bytes: bytes, file_name: str, egr_code: str) -> pd.DataFrame:
-    """Filtra transacciones de comisionistas y separa codigo/nombre proveedor."""
-    dataframe = read_report_dataframe(file_bytes, file_name, skiprows=2)
-    dataframe.columns = dataframe.columns.astype(str).str.strip()
-
-    required_columns = {"CUENTA", "DETALLE"}
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_text = ", ".join(sorted(missing_columns))
-        raise ValueError(f"El archivo {file_name} no contiene columnas requeridas: {missing_text}")
-
-    account_series = dataframe["CUENTA"].astype(str)
-    filtered = dataframe[
-        account_series.str.contains("Proveedores Locales", case=False, na=False)
-    ].copy()
-
-    if filtered.empty:
-        print(f"No se encontraron comisionistas validos en {file_name}")
-        return pd.DataFrame(columns=PAD_COLUMNS)
-
-    detail_complete = filtered["DETALLE"].fillna("").astype(str).str.strip()
-    filtered["EGR"] = egr_code
-    filtered["CODIGO_PROVEEDOR"] = detail_complete.str[:9].str.strip()
-    filtered["DETALLE"] = detail_complete.str[9:].str.strip()
-    filtered["DETALLE_COMPLETO"] = detail_complete
-
-    valid_transactions = filtered[
-        (filtered["CODIGO_PROVEEDOR"] != "") & (filtered["DETALLE"] != "")
-    ][PAD_COLUMNS].copy()
-
-    print(f"Transacciones de comisionistas validas: {len(valid_transactions)}")
-    return valid_transactions
 
 
 def sanitize_folder_name(folder_name: str) -> str:
@@ -319,7 +234,7 @@ def process_file(access_token: str, file_item: dict[str, Any], batch_date: str) 
     code = extract_code_from_file(file_bytes, file_name)
     print(f"Codigo {code} extraido")
 
-    transactions = extract_commissioner_transactions(file_bytes, file_name, code)
+    transactions = extract_transactions_intelligently(file_bytes, file_name, code)
     create_destination_hierarchy(access_token, batch_date, code, transactions)
     return transactions
 
