@@ -1,6 +1,7 @@
 import io
 import os
-from typing import Any, Optional
+import re
+from typing import Any, Optional, Union
 from urllib.parse import quote
 from zipfile import BadZipFile
 
@@ -34,6 +35,11 @@ class EgresosRequest(BaseModel):
 class FileError(BaseModel):
     archivo: str
     error: str
+
+
+class IgnoredResponse(BaseModel):
+    status: str
+    message: str
 
 
 class ProcessResponse(BaseModel):
@@ -171,12 +177,42 @@ def extract_egr(file_bytes: bytes, file_name: str) -> str:
     return egr
 
 
+def detect_header_row(file_bytes: bytes, file_name: str) -> int:
+    preview = read_report_dataframe(file_bytes, file_name, nrows=10, header=None)
+    expected_headers = {"DOCUMENTO", "DETALLE"}
+
+    for row_index, row in preview.iterrows():
+        normalized_values = {
+            str(value).strip().upper()
+            for value in row.dropna().tolist()
+        }
+        if normalized_values.intersection(expected_headers):
+            print(f"Fila de encabezados detectada en indice {row_index} para {file_name}")
+            return int(row_index)
+
+    raise ValueError(
+        f"No se encontro fila de encabezados con DOCUMENTO o DETALLE en {file_name}"
+    )
+
+
+def extract_provider_from_detail(detail_value: Any) -> tuple[str, str]:
+    detail_text = str(detail_value).strip()
+    match = re.search(r"\bFC\b\s*([0-9]+)\s+(.+)$", detail_text, flags=re.IGNORECASE)
+    if not match:
+        return "", ""
+
+    provider_code = match.group(1).strip()
+    provider_name = match.group(2).strip()
+    return provider_code, provider_name
+
+
 def extract_commissioner_transactions(
     file_bytes: bytes,
     file_name: str,
     egr: str,
 ) -> pd.DataFrame:
-    dataframe = read_report_dataframe(file_bytes, file_name, skiprows=2)
+    header_row = detect_header_row(file_bytes, file_name)
+    dataframe = read_report_dataframe(file_bytes, file_name, header=header_row)
     dataframe.columns = dataframe.columns.astype(str).str.strip()
 
     required_columns = {"CUENTA", "DETALLE"}
@@ -195,9 +231,10 @@ def extract_commissioner_transactions(
         return pd.DataFrame(columns=PAD_COLUMNS)
 
     detail_complete = filtered["DETALLE"].fillna("").astype(str).str.strip()
+    provider_data = detail_complete.apply(extract_provider_from_detail)
     filtered["EGR"] = egr
-    filtered["CODIGO_PROVEEDOR"] = detail_complete.str[:9].str.strip()
-    filtered["DETALLE"] = detail_complete.str[9:].str.strip()
+    filtered["CODIGO_PROVEEDOR"] = provider_data.apply(lambda value: value[0])
+    filtered["DETALLE"] = provider_data.apply(lambda value: value[1])
     filtered["DETALLE_COMPLETO"] = detail_complete
 
     transactions = filtered[
@@ -241,6 +278,11 @@ def extract_file_name_from_path(clean_path: str) -> str:
         raise ValueError("No se pudo extraer el nombre de archivo desde ruta_completa")
 
     return file_name
+
+
+def should_process_excel_path(path_value: str) -> bool:
+    file_name = path_value.strip().replace("\\", "/").rstrip("/").split("/")[-1]
+    return file_name.lower().endswith((".xls", ".xlsx"))
 
 
 def extract_parent_folder_from_path(clean_path: str) -> str:
@@ -376,7 +418,12 @@ def create_destination_hierarchy(
         "Nivel 2 Egreso",
     )
 
-    for transaction in transactions.to_dict("records"):
+    unique_transactions = transactions.drop_duplicates(
+        subset=["CODIGO_PROVEEDOR", "DETALLE"]
+    )
+    print(f"Creando/validando carpetas FC unicas: {len(unique_transactions)}")
+
+    for transaction in unique_transactions.to_dict("records"):
         folder_name = f"FC {transaction['CODIGO_PROVEEDOR']} {transaction['DETALLE']}"
         ensure_folder(
             access_token,
@@ -516,9 +563,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/procesar-egresos", response_model=ProcessResponse)
-def procesar_egresos(request: EgresosRequest) -> ProcessResponse:
+@app.post("/api/v1/procesar-egresos", response_model=Union[ProcessResponse, IgnoredResponse])
+def procesar_egresos(request: EgresosRequest) -> Union[ProcessResponse, IgnoredResponse]:
     try:
+        if not should_process_excel_path(request.ruta_completa):
+            print(f"Archivo ignorado para evitar bucle: {request.ruta_completa}")
+            return IgnoredResponse(
+                status="ignored",
+                message="El archivo no es un Excel, se ignora para evitar bucles",
+            )
+
         print(
             "Iniciando procesamiento por ruta de egreso: "
             f"{request.ruta_completa}"
