@@ -210,9 +210,45 @@ def leer_archivo_inteligente(stream: io.BytesIO, file_name: str) -> pd.DataFrame
             dataframe.columns = dataframe.columns.astype(str).str.strip()
             return dataframe
 
-    raise ValueError(
-        f"No se encontro fila de encabezados con DOCUMENTO o CUENTA en {file_name}"
+    print(
+        f"No se encontro encabezado DOCUMENTO/CUENTA en {file_name}; "
+        "aplicando lectura posicional"
     )
+    return leer_archivo_posicional(stream, file_name)
+
+
+def clean_numeric_text(value: Any) -> str:
+    text = str(value).strip()
+    text = re.sub(r"\.0$", "", text)
+    return text
+
+
+def leer_archivo_posicional(stream: io.BytesIO, file_name: str) -> pd.DataFrame:
+    raw_dataframe = read_stream_dataframe(stream, file_name, header=None)
+    raw_dataframe = raw_dataframe.dropna(how="all").copy()
+
+    if raw_dataframe.shape[1] < 3:
+        raise ValueError(
+            f"No se encontro fila de encabezados ni estructura posicional valida en {file_name}"
+        )
+
+    provider_codes = raw_dataframe.iloc[:, 1].apply(clean_numeric_text)
+    provider_names = raw_dataframe.iloc[:, 2].fillna("").astype(str).str.strip()
+    valid_rows = provider_codes.str.fullmatch(r"\d+", na=False) & (provider_names != "")
+
+    positional = pd.DataFrame(
+        {
+            "CUENTA": "Proveedores Locales",
+            "CODIGO_PROVEEDOR": provider_codes[valid_rows],
+            "DETALLE": provider_names[valid_rows],
+        }
+    )
+    positional["DETALLE_COMPLETO"] = (
+        positional["CODIGO_PROVEEDOR"] + " " + positional["DETALLE"]
+    )
+
+    print(f"Filas posicionales validas detectadas en {file_name}: {len(positional)}")
+    return positional.reset_index(drop=True)
 
 
 def filtrar_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -235,7 +271,9 @@ def extract_provider_from_detail(detail_value: Any) -> tuple[str, str]:
     detail_text = str(detail_value).strip()
     match = re.search(r"\bFC\b\s*([0-9]+)\s+(.+)$", detail_text, flags=re.IGNORECASE)
     if not match:
-        return "", ""
+        match = re.search(r"^\s*([0-9]+)\s+(.+)$", detail_text)
+        if not match:
+            return "", ""
 
     provider_code = match.group(1).strip()
     provider_name = match.group(2).strip()
@@ -256,12 +294,19 @@ def extract_commissioner_transactions(
         print(f"No hay comisionistas validos en {file_name}")
         return pd.DataFrame(columns=PAD_COLUMNS)
 
-    detail_complete = filtered["DETALLE"].fillna("").astype(str).str.strip()
-    provider_data = detail_complete.apply(extract_provider_from_detail)
     filtered["EGR"] = egr
-    filtered["CODIGO_PROVEEDOR"] = provider_data.apply(lambda value: value[0])
-    filtered["DETALLE"] = provider_data.apply(lambda value: value[1])
-    filtered["DETALLE_COMPLETO"] = detail_complete
+    if {"CODIGO_PROVEEDOR", "DETALLE_COMPLETO"}.issubset(filtered.columns):
+        filtered["CODIGO_PROVEEDOR"] = filtered["CODIGO_PROVEEDOR"].astype(str).str.strip()
+        filtered["DETALLE"] = filtered["DETALLE"].fillna("").astype(str).str.strip()
+        filtered["DETALLE_COMPLETO"] = (
+            filtered["DETALLE_COMPLETO"].fillna("").astype(str).str.strip()
+        )
+    else:
+        detail_complete = filtered["DETALLE"].fillna("").astype(str).str.strip()
+        provider_data = detail_complete.apply(extract_provider_from_detail)
+        filtered["CODIGO_PROVEEDOR"] = provider_data.apply(lambda value: value[0])
+        filtered["DETALLE"] = provider_data.apply(lambda value: value[1])
+        filtered["DETALLE_COMPLETO"] = detail_complete
 
     transactions = filtered[
         (filtered["CODIGO_PROVEEDOR"] != "") & (filtered["DETALLE"] != "")
