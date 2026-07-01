@@ -221,7 +221,10 @@ def extract_commissioner_transactions(
         missing_text = ", ".join(sorted(missing_columns))
         raise ValueError(f"Faltan columnas requeridas en {file_name}: {missing_text}")
 
-    account_series = dataframe["CUENTA"].astype(str)
+    account_column = "NOMBRE CTA." if "NOMBRE CTA." in dataframe.columns else "CUENTA"
+    print(f"Filtrando Proveedores Locales usando columna: {account_column}")
+
+    account_series = dataframe[account_column].astype(str)
     filtered = dataframe[
         account_series.str.contains("Proveedores Locales", case=False, na=False)
     ].copy()
