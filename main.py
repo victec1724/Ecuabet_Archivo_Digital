@@ -123,26 +123,24 @@ def read_report_dataframe(
     *,
     nrows: Optional[int] = None,
     header: Optional[int] = 0,
-    skiprows: Optional[int] = None,
 ) -> pd.DataFrame:
     stream = io.BytesIO(file_bytes)
     normalized_name = file_name.lower()
 
     if normalized_name.endswith(".csv"):
-        return pd.read_csv(stream, nrows=nrows, header=header, skiprows=skiprows)
+        return pd.read_csv(stream, nrows=nrows, header=header)
 
     if normalized_name.endswith(".xlsx"):
         return pd.read_excel(
             stream,
             nrows=nrows,
             header=header,
-            skiprows=skiprows,
             engine="openpyxl",
         )
 
     if normalized_name.endswith(".xls"):
         try:
-            return pd.read_excel(stream, nrows=nrows, header=header, skiprows=skiprows)
+            return pd.read_excel(stream, nrows=nrows, header=header)
         except (ValueError, BadZipFile, ImportError, OSError) as excel_error:
             print(
                 f"Lectura Excel fallo para {file_name}; "
@@ -154,7 +152,6 @@ def read_report_dataframe(
                 sep=",",
                 nrows=nrows,
                 header=header,
-                skiprows=skiprows,
                 on_bad_lines="skip",
             )
 
@@ -177,9 +174,45 @@ def extract_egr(file_bytes: bytes, file_name: str) -> str:
     return egr
 
 
-def detect_header_row(file_bytes: bytes, file_name: str) -> int:
-    preview = read_report_dataframe(file_bytes, file_name, nrows=10, header=None)
-    expected_headers = {"DOCUMENTO", "DETALLE"}
+def read_stream_dataframe(
+    stream: io.BytesIO,
+    file_name: str,
+    *,
+    nrows: Optional[int] = None,
+    header: Optional[int] = 0,
+) -> pd.DataFrame:
+    stream.seek(0)
+    normalized_name = file_name.lower()
+
+    if normalized_name.endswith(".csv"):
+        return pd.read_csv(stream, nrows=nrows, header=header, on_bad_lines="skip")
+
+    if normalized_name.endswith(".xlsx"):
+        return pd.read_excel(stream, nrows=nrows, header=header, engine="openpyxl")
+
+    if normalized_name.endswith(".xls"):
+        try:
+            return pd.read_excel(stream, nrows=nrows, header=header)
+        except (ValueError, BadZipFile, ImportError, OSError) as excel_error:
+            print(
+                f"Lectura Excel fallo para {file_name}; "
+                f"intentando contingencia CSV: {excel_error}"
+            )
+            stream.seek(0)
+            return pd.read_csv(
+                stream,
+                sep=",",
+                nrows=nrows,
+                header=header,
+                on_bad_lines="skip",
+            )
+
+    raise ValueError(f"Extension no soportada para el archivo: {file_name}")
+
+
+def leer_archivo_inteligente(stream: io.BytesIO, file_name: str) -> pd.DataFrame:
+    preview = read_stream_dataframe(stream, file_name, nrows=20, header=None)
+    expected_headers = {"DOCUMENTO", "CUENTA"}
 
     for row_index, row in preview.iterrows():
         normalized_values = {
@@ -187,12 +220,31 @@ def detect_header_row(file_bytes: bytes, file_name: str) -> int:
             for value in row.dropna().tolist()
         }
         if normalized_values.intersection(expected_headers):
-            print(f"Fila de encabezados detectada en indice {row_index} para {file_name}")
-            return int(row_index)
+            header_row = int(row_index)
+            print(f"Fila de encabezados detectada en indice {header_row} para {file_name}")
+            dataframe = read_stream_dataframe(stream, file_name, header=header_row)
+            dataframe.columns = dataframe.columns.astype(str).str.strip()
+            return dataframe
 
     raise ValueError(
-        f"No se encontro fila de encabezados con DOCUMENTO o DETALLE en {file_name}"
+        f"No se encontro fila de encabezados con DOCUMENTO o CUENTA en {file_name}"
     )
+
+
+def filtrar_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"CUENTA", "DETALLE"}
+    missing_columns = required_columns - set(dataframe.columns)
+    if missing_columns:
+        missing_text = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Faltan columnas requeridas: {missing_text}")
+
+    account_column = "NOMBRE CTA." if "NOMBRE CTA." in dataframe.columns else "CUENTA"
+    print(f"Filtrando Proveedores Locales usando columna: {account_column}")
+
+    account_series = dataframe[account_column].astype(str)
+    return dataframe[
+        account_series.str.contains("Proveedores Locales", case=False, na=False)
+    ].copy()
 
 
 def extract_provider_from_detail(detail_value: Any) -> tuple[str, str]:
@@ -211,23 +263,10 @@ def extract_commissioner_transactions(
     file_name: str,
     egr: str,
 ) -> pd.DataFrame:
-    header_row = detect_header_row(file_bytes, file_name)
-    dataframe = read_report_dataframe(file_bytes, file_name, header=header_row)
-    dataframe.columns = dataframe.columns.astype(str).str.strip()
-
-    required_columns = {"CUENTA", "DETALLE"}
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        missing_text = ", ".join(sorted(missing_columns))
-        raise ValueError(f"Faltan columnas requeridas en {file_name}: {missing_text}")
-
-    account_column = "NOMBRE CTA." if "NOMBRE CTA." in dataframe.columns else "CUENTA"
-    print(f"Filtrando Proveedores Locales usando columna: {account_column}")
-
-    account_series = dataframe[account_column].astype(str)
-    filtered = dataframe[
-        account_series.str.contains("Proveedores Locales", case=False, na=False)
-    ].copy()
+    stream = io.BytesIO(file_bytes)
+    dataframe = leer_archivo_inteligente(stream, file_name)
+    filtered = filtrar_dataframe(dataframe)
+    del dataframe
 
     if filtered.empty:
         print(f"No hay comisionistas validos en {file_name}")
@@ -250,7 +289,7 @@ def extract_commissioner_transactions(
 
 def sanitize_folder_name(folder_name: str) -> str:
     invalid_chars = '"*:<>?/\\|'
-    sanitized_name = "".join("_" if char in invalid_chars else char for char in folder_name)
+    sanitized_name = "".join("-" if char in invalid_chars else char for char in folder_name)
     sanitized_name = sanitized_name.strip().rstrip(".")
     if not sanitized_name:
         raise ValueError("El nombre de carpeta quedo vacio despues de sanitizar")
