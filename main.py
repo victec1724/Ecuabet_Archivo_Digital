@@ -438,6 +438,31 @@ def list_drive_children_by_path(
     return items
 
 
+def list_pdf_items_recursive(
+    access_token: str,
+    config: dict[str, str],
+    folder_path: str,
+) -> list[dict[str, Any]]:
+    pdf_items: list[dict[str, Any]] = []
+
+    try:
+        children = list_drive_children_by_path(access_token, config, folder_path)
+    except requests.HTTPError:
+        return pdf_items
+
+    for item in children:
+        item_name = item.get("name", "")
+        if "file" in item and item_name.lower().endswith(".pdf"):
+            pdf_items.append(item)
+            continue
+
+        if "folder" in item:
+            child_path = f"{folder_path.rstrip('/')}/{item_name}"
+            pdf_items.extend(list_pdf_items_recursive(access_token, config, child_path))
+
+    return pdf_items
+
+
 def download_drive_item_bytes(
     access_token: str,
     config: dict[str, str],
@@ -504,24 +529,16 @@ def invoice_matches_provider(
 def copiar_factura_pdf_proveedor(
     access_token: str,
     config: dict[str, str],
-    carpeta_fecha: str,
     transaction: dict[str, Any],
     destination_folder_id: str,
 ) -> None:
     provider_code = str(transaction.get("CODIGO_PROVEEDOR", "")).strip()
     provider_name = str(transaction.get("DETALLE", "")).strip()
     provider_label = f"{provider_code} {provider_name}".strip()
-    invoice_day_path = (
-        f"{config['facturas_base_path'].rstrip('/')}/{carpeta_fecha.strip('/')}"
-    )
+    invoice_month_path = config["facturas_base_path"].rstrip("/")
 
-    try:
-        invoice_items = list_drive_children_by_path(
-            access_token,
-            config,
-            invoice_day_path,
-        )
-    except requests.HTTPError:
+    invoice_items = list_pdf_items_recursive(access_token, config, invoice_month_path)
+    if not invoice_items:
         print(f"Factura no encontrada para {provider_label}")
         return
 
@@ -645,7 +662,6 @@ def create_destination_hierarchy(
         copiar_factura_pdf_proveedor(
             access_token,
             config,
-            carpeta_fecha,
             transaction,
             fc_folder["id"],
         )
