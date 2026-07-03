@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import unicodedata
 from typing import Any, Optional, Union
 from urllib.parse import quote
 from zipfile import BadZipFile
@@ -20,6 +21,7 @@ GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SUPPORTED_EXTENSIONS = (".xls", ".xlsx", ".csv")
 PAD_COLUMNS = ["EGR", "CODIGO_PROVEEDOR", "DETALLE", "DETALLE_COMPLETO"]
 CONTROL_CSV_PREFIX = "CSV_"
+DEFAULT_FACTURAS_BASE_PATH = "SPORTEK/2026/05 COMISIONES/5. XML FACTURAS/6. JUNIO"
 
 app = FastAPI(
     title="Ecuabet RPA SharePoint Service",
@@ -69,6 +71,10 @@ def get_config() -> dict[str, str]:
         "client_secret": get_required_env("GRAPH_CLIENT_SECRET"),
         "site_id": os.environ.get("GRAPH_SITE_ID") or os.environ.get("SITE_ID") or "",
         "drive_id": get_required_env("GRAPH_DRIVE_ID"),
+        "facturas_base_path": os.environ.get(
+            "GRAPH_FACTURAS_BASE_PATH",
+            DEFAULT_FACTURAS_BASE_PATH,
+        ),
     }
 
 
@@ -408,6 +414,138 @@ def list_child_folders(
     return folders
 
 
+def list_drive_children_by_path(
+    access_token: str,
+    config: dict[str, str],
+    folder_path: str,
+) -> list[dict[str, Any]]:
+    drive_id = config["drive_id"]
+    site_id = config.get("site_id")
+    if not site_id:
+        raise RuntimeError("Falta GRAPH_SITE_ID o SITE_ID para listar facturas")
+
+    encoded_path = quote(folder_path.strip("/"), safe="/")
+    url = f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/children"
+    items: list[dict[str, Any]] = []
+
+    while url:
+        response = requests.get(url, headers=build_headers(access_token), timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        items.extend(payload.get("value", []))
+        url = payload.get("@odata.nextLink")
+
+    return items
+
+
+def download_drive_item_bytes(
+    access_token: str,
+    config: dict[str, str],
+    item_id: str,
+) -> bytes:
+    drive_id = config["drive_id"]
+    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}/content"
+    response = requests.get(url, headers=build_headers(access_token), timeout=120)
+    response.raise_for_status()
+    return response.content
+
+
+def upload_bytes_to_folder(
+    access_token: str,
+    config: dict[str, str],
+    folder_id: str,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> str:
+    drive_id = config["drive_id"]
+    encoded_name = quote(file_name, safe="")
+    url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{folder_id}:/{encoded_name}:/content"
+    response = requests.put(
+        url,
+        headers=build_headers(access_token, content_type),
+        data=file_bytes,
+        timeout=120,
+    )
+    response.raise_for_status()
+    uploaded_file = response.json()
+    return uploaded_file.get("webUrl", file_name)
+
+
+def normalize_match_text(value: Any) -> str:
+    text = str(value).lower().replace("_", " ")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def invoice_matches_provider(
+    pdf_name: str,
+    provider_code: str,
+    provider_name: str,
+) -> bool:
+    pdf_digits = re.sub(r"\D+", "", pdf_name)
+    provider_digits = re.sub(r"\D+", "", str(provider_code))
+    if len(provider_digits) >= 10 and provider_digits in pdf_digits:
+        return True
+
+    normalized_pdf = normalize_match_text(pdf_name)
+    normalized_provider = normalize_match_text(provider_name)
+    if not normalized_provider:
+        return False
+
+    return (
+        normalized_provider in normalized_pdf
+        or normalized_provider.replace(" ", "") in normalized_pdf.replace(" ", "")
+    )
+
+
+def copiar_factura_pdf_proveedor(
+    access_token: str,
+    config: dict[str, str],
+    carpeta_fecha: str,
+    transaction: dict[str, Any],
+    destination_folder_id: str,
+) -> None:
+    provider_code = str(transaction.get("CODIGO_PROVEEDOR", "")).strip()
+    provider_name = str(transaction.get("DETALLE", "")).strip()
+    provider_label = f"{provider_code} {provider_name}".strip()
+    invoice_day_path = (
+        f"{config['facturas_base_path'].rstrip('/')}/{carpeta_fecha.strip('/')}"
+    )
+
+    try:
+        invoice_items = list_drive_children_by_path(
+            access_token,
+            config,
+            invoice_day_path,
+        )
+    except requests.HTTPError:
+        print(f"Factura no encontrada para {provider_label}")
+        return
+
+    for item in invoice_items:
+        pdf_name = item.get("name", "")
+        if "file" not in item or not pdf_name.lower().endswith(".pdf"):
+            continue
+
+        if invoice_matches_provider(pdf_name, provider_code, provider_name):
+            pdf_bytes = download_drive_item_bytes(access_token, config, item["id"])
+            uploaded_url = upload_bytes_to_folder(
+                access_token,
+                config,
+                destination_folder_id,
+                pdf_name,
+                pdf_bytes,
+                "application/pdf",
+            )
+            print(f"Factura copiada para {provider_label}: {uploaded_url}")
+            return
+
+    print(f"Factura no encontrada para {provider_label}")
+
+
 def find_child_folder(
     access_token: str,
     drive_id: str,
@@ -478,6 +616,7 @@ def create_destination_hierarchy(
     config: dict[str, str],
     parent_folder_id: str,
     egreso_base_name: str,
+    carpeta_fecha: str,
     transactions: pd.DataFrame,
 ) -> None:
     drive_id = config["drive_id"]
@@ -496,12 +635,19 @@ def create_destination_hierarchy(
 
     for transaction in unique_transactions.to_dict("records"):
         folder_name = f"FC {transaction['CODIGO_PROVEEDOR']} {transaction['DETALLE']}"
-        ensure_folder(
+        fc_folder = ensure_folder(
             access_token,
             drive_id,
             egreso_folder["id"],
             folder_name,
             "Nivel 3 Factura Comisionista",
+        )
+        copiar_factura_pdf_proveedor(
+            access_token,
+            config,
+            carpeta_fecha,
+            transaction,
+            fc_folder["id"],
         )
 
 
@@ -567,6 +713,7 @@ def process_file(
     nombre_archivo: str,
     parent_folder_id: str,
     egreso_base_name: str,
+    carpeta_fecha: str,
 ) -> pd.DataFrame:
     print(f"Procesando archivo: {nombre_archivo}")
     file_bytes = download_file_bytes_by_path(access_token, config, clean_path)
@@ -580,6 +727,7 @@ def process_file(
         config,
         parent_folder_id,
         egreso_base_name,
+        carpeta_fecha,
         transactions,
     )
     return transactions
@@ -606,6 +754,7 @@ def run_egresos_process(ruta_completa: str) -> ProcessResponse:
             nombre_archivo,
             parent_folder["id"],
             egreso_base_name,
+            carpeta_fecha,
         )
     except requests.HTTPError:
         raise
