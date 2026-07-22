@@ -1,9 +1,11 @@
 import io
 import os
 import re
+import sys
 import threading
 import time
 import unicodedata
+from datetime import datetime
 from typing import Any, Optional, Union
 from urllib.parse import quote
 from zipfile import BadZipFile
@@ -12,7 +14,7 @@ import msal
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
 
@@ -23,12 +25,23 @@ GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SUPPORTED_EXTENSIONS = (".xls", ".xlsx", ".csv")
 PAD_COLUMNS = ["EGR", "CODIGO_PROVEEDOR", "DETALLE", "DETALLE_COMPLETO"]
 CONTROL_CSV_PREFIX = "CSV_"
+CONTROL_LOG_PREFIX = "LOG_"
 DEFAULT_FACTURAS_BASE_PATH = "SPORTEK/2026/05 COMISIONES/5. XML FACTURAS/7. JULIO"
 FACTURA_SEARCH_MAX_ATTEMPTS = 25
 FACTURA_SEARCH_RETRY_DELAY_SECONDS = int(
     os.environ.get("GRAPH_FACTURA_SEARCH_RETRY_SECONDS", "10")
 )
 _process_lock = threading.Lock()
+_current_logs: Optional[list[str]] = None
+
+
+def log_event(message: str) -> None:
+    """Escribe en consola y, si hay un buffer activo, guarda el evento para el LOG."""
+    sys.stdout.write(f"{message}\n")
+    sys.stdout.flush()
+    if _current_logs is not None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _current_logs.append(f"[{timestamp}] {message}")
 
 app = FastAPI(
     title="Ecuabet RPA SharePoint Service",
@@ -41,26 +54,14 @@ class EgresosRequest(BaseModel):
     ruta_completa: str
 
 
-class FileError(BaseModel):
-    archivo: str
-    error: str
-
-
 class IgnoredResponse(BaseModel):
     status: str
     message: str
 
 
-class ProcessResponse(BaseModel):
+class AcceptedResponse(BaseModel):
     status: str
-    ruta_completa: str
-    ruta_limpia: str
-    nombre_archivo: str
-    carpeta_fecha: str
-    csv_generado: str
-    transacciones_exportadas: int
-    archivo_control: str
-    errores: list[FileError]
+    message: str
 
 
 def get_required_env(variable_name: str) -> str:
@@ -155,7 +156,7 @@ def read_report_dataframe(
         try:
             return pd.read_excel(stream, nrows=nrows, header=header)
         except (ValueError, BadZipFile, ImportError, OSError) as excel_error:
-            print(
+            log_event(
                 f"Lectura Excel fallo para {file_name}; "
                 f"intentando contingencia CSV: {excel_error}"
             )
@@ -191,7 +192,7 @@ def read_stream_dataframe(
         try:
             return pd.read_excel(stream, nrows=nrows, header=header)
         except (ValueError, BadZipFile, ImportError, OSError) as excel_error:
-            print(
+            log_event(
                 f"Lectura Excel fallo para {file_name}; "
                 f"intentando contingencia CSV: {excel_error}"
             )
@@ -218,12 +219,12 @@ def leer_archivo_inteligente(stream: io.BytesIO, file_name: str) -> pd.DataFrame
         }
         if normalized_values.intersection(expected_headers):
             header_row = int(row_index)
-            print(f"Fila de encabezados detectada en indice {header_row} para {file_name}")
+            log_event(f"Fila de encabezados detectada en indice {header_row} para {file_name}")
             dataframe = read_stream_dataframe(stream, file_name, header=header_row)
             dataframe.columns = dataframe.columns.astype(str).str.strip()
             return dataframe
 
-    print(
+    log_event(
         f"No se encontro encabezado DOCUMENTO/CUENTA en {file_name}; "
         "aplicando lectura posicional"
     )
@@ -260,7 +261,7 @@ def leer_archivo_posicional(stream: io.BytesIO, file_name: str) -> pd.DataFrame:
         positional["CODIGO_PROVEEDOR"] + " " + positional["DETALLE"]
     )
 
-    print(f"Filas posicionales validas detectadas en {file_name}: {len(positional)}")
+    log_event(f"Filas posicionales validas detectadas en {file_name}: {len(positional)}")
     return positional.reset_index(drop=True)
 
 
@@ -272,7 +273,7 @@ def filtrar_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Faltan columnas requeridas: {missing_text}")
 
     account_column = "NOMBRE CTA." if "NOMBRE CTA." in dataframe.columns else "CUENTA"
-    print(f"Filtrando Proveedores Locales usando columna: {account_column}")
+    log_event(f"Filtrando Proveedores Locales usando columna: {account_column}")
 
     account_series = dataframe[account_column].astype(str)
     return dataframe[
@@ -304,7 +305,7 @@ def extract_commissioner_transactions(
     del dataframe
 
     if filtered.empty:
-        print(f"No hay comisionistas validos en {file_name}")
+        log_event(f"No hay comisionistas validos en {file_name}")
         return pd.DataFrame(columns=PAD_COLUMNS)
 
     filtered["EGR"] = egr
@@ -325,7 +326,7 @@ def extract_commissioner_transactions(
         (filtered["CODIGO_PROVEEDOR"] != "") & (filtered["DETALLE"] != "")
     ][PAD_COLUMNS].copy()
 
-    print(f"{file_name}: transacciones validas filtradas: {len(transactions)}")
+    log_event(f"{file_name}: transacciones validas filtradas: {len(transactions)}")
     return transactions
 
 
@@ -578,21 +579,21 @@ def copiar_factura_pdf_proveedor(
                 pdf_bytes,
                 "application/pdf",
             )
-            print(
+            log_event(
                 f"Factura copiada para {provider_label} "
                 f"(intento {attempt}/{FACTURA_SEARCH_MAX_ATTEMPTS}): {uploaded_url}"
             )
             return True
 
         if attempt < FACTURA_SEARCH_MAX_ATTEMPTS:
-            print(
+            log_event(
                 f"Factura no encontrada para {provider_label} "
                 f"(intento {attempt}/{FACTURA_SEARCH_MAX_ATTEMPTS}); "
                 f"reintentando en {FACTURA_SEARCH_RETRY_DELAY_SECONDS}s..."
             )
             time.sleep(FACTURA_SEARCH_RETRY_DELAY_SECONDS)
 
-    print(
+    log_event(
         f"Factura no encontrada para {provider_label} "
         f"tras {FACTURA_SEARCH_MAX_ATTEMPTS} intentos; se continua con la siguiente"
     )
@@ -621,7 +622,7 @@ def ensure_folder(
     level_label: str,
 ) -> dict[str, Any]:
     safe_folder_name = sanitize_folder_name(folder_name)
-    print(f"Validando carpeta {level_label}: {safe_folder_name}")
+    log_event(f"Validando carpeta {level_label}: {safe_folder_name}")
 
     existing_folder = find_child_folder(
         access_token,
@@ -630,10 +631,10 @@ def ensure_folder(
         safe_folder_name,
     )
     if existing_folder:
-        print(f"Carpeta {level_label} existente: {existing_folder['name']}")
+        log_event(f"Carpeta {level_label} existente: {existing_folder['name']}")
         return existing_folder
 
-    print(f"Creando carpeta {level_label}: {safe_folder_name}")
+    log_event(f"Creando carpeta {level_label}: {safe_folder_name}")
     url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{parent_folder_id}/children"
     payload = {
         "name": safe_folder_name,
@@ -655,12 +656,12 @@ def ensure_folder(
             safe_folder_name,
         )
         if existing_folder:
-            print(f"Carpeta {level_label} encontrada tras conflicto")
+            log_event(f"Carpeta {level_label} encontrada tras conflicto")
             return existing_folder
 
     response.raise_for_status()
     created_folder = response.json()
-    print(f"Carpeta {level_label} creada: {created_folder.get('name', safe_folder_name)}")
+    log_event(f"Carpeta {level_label} creada: {created_folder.get('name', safe_folder_name)}")
     return created_folder
 
 
@@ -685,7 +686,7 @@ def create_destination_hierarchy(
         subset=["CODIGO_PROVEEDOR", "DETALLE"]
     )
     transaction_records = unique_transactions.to_dict("records")
-    print(f"Creando/validando carpetas FC unicas: {len(transaction_records)}")
+    log_event(f"Creando/validando carpetas FC unicas: {len(transaction_records)}")
 
     fc_destinations: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for transaction in transaction_records:
@@ -699,7 +700,7 @@ def create_destination_hierarchy(
         )
         fc_destinations.append((transaction, fc_folder))
 
-    print(
+    log_event(
         f"Carpetas FC listas. Iniciando copia de facturas con hasta "
         f"{FACTURA_SEARCH_MAX_ATTEMPTS} intentos por proveedor"
     )
@@ -738,6 +739,39 @@ def build_control_csv_name(file_name: str) -> str:
     return f"{CONTROL_CSV_PREFIX}{file_base_name}.csv"
 
 
+def build_control_log_name(file_name: str) -> str:
+    file_base_name = sanitize_folder_name(get_file_base_name(file_name))
+    return f"{CONTROL_LOG_PREFIX}{file_base_name}.txt"
+
+
+def upload_text_file(
+    access_token: str,
+    config: dict[str, str],
+    parent_path: str,
+    file_bytes: bytes,
+    file_name: str,
+    content_type: str,
+) -> str:
+    drive_id = config["drive_id"]
+    site_id = config.get("site_id")
+    if not site_id:
+        raise RuntimeError("Falta GRAPH_SITE_ID o SITE_ID para subir archivo por ruta")
+
+    upload_path = f"{parent_path.rstrip('/')}/{file_name}"
+    encoded_upload_path = quote(upload_path, safe="/")
+    url = f"{GRAPH_BASE_URL}/sites/{site_id}/drives/{drive_id}/root:/{encoded_upload_path}:/content"
+    response = requests.put(
+        url,
+        headers=build_headers(access_token, content_type),
+        data=file_bytes,
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    uploaded_file = response.json()
+    return uploaded_file.get("webUrl", file_name)
+
+
 def upload_control_csv(
     access_token: str,
     config: dict[str, str],
@@ -763,7 +797,7 @@ def upload_control_csv(
 
     uploaded_file = response.json()
     web_url = uploaded_file.get("webUrl", csv_name)
-    print(f"CSV de control subido a SharePoint: {web_url}")
+    log_event(f"CSV de control subido a SharePoint: {web_url}")
     return web_url
 
 
@@ -776,11 +810,11 @@ def process_file(
     egreso_base_name: str,
     carpeta_fecha: str,
 ) -> pd.DataFrame:
-    print(f"Procesando archivo: {nombre_archivo}")
+    log_event(f"Procesando archivo: {nombre_archivo}")
     file_bytes = download_file_bytes_by_path(access_token, config, clean_path)
 
     egr = egreso_base_name
-    print(f"EGR definido desde nombre de archivo: {egr}")
+    log_event(f"EGR definido desde nombre de archivo: {egr}")
 
     transactions = extract_commissioner_transactions(file_bytes, nombre_archivo, egr)
     create_destination_hierarchy(
@@ -794,49 +828,103 @@ def process_file(
     return transactions
 
 
-def run_egresos_process(ruta_completa: str) -> ProcessResponse:
-    config = get_config()
-    access_token = get_access_token(config)
-    clean_path = normalize_graph_path(ruta_completa)
-    nombre_archivo = extract_file_name_from_path(clean_path)
-    carpeta_fecha = extract_parent_folder_from_path(clean_path)
-    parent_path = extract_parent_path_from_path(clean_path)
-    parent_folder = get_drive_item_by_path(access_token, config, parent_path)
-    errors: list[FileError] = []
-    transactions = pd.DataFrame(columns=PAD_COLUMNS)
-    csv_name = build_control_csv_name(nombre_archivo)
-    egreso_base_name = sanitize_folder_name(get_file_base_name(nombre_archivo))
+def upload_process_log(
+    access_token: Optional[str],
+    config: Optional[dict[str, str]],
+    parent_path: Optional[str],
+    nombre_archivo: Optional[str],
+    log_lines: list[str],
+) -> None:
+    """Sube el buffer de logs como LOG_<egreso>.txt junto al Excel (best-effort)."""
+    if not (access_token and config and parent_path and nombre_archivo):
+        sys.stdout.write(
+            "No se pudo subir el LOG a SharePoint: falta contexto "
+            "(token, config, ruta o nombre de archivo)\n"
+        )
+        return
 
     try:
-        transactions = process_file(
+        log_name = build_control_log_name(nombre_archivo)
+        log_bytes = ("\n".join(log_lines) + "\n").encode("utf-8-sig")
+        log_url = upload_text_file(
             access_token,
             config,
-            clean_path,
-            nombre_archivo,
-            parent_folder["id"],
-            egreso_base_name,
-            carpeta_fecha,
+            parent_path,
+            log_bytes,
+            log_name,
+            "text/plain; charset=utf-8",
         )
-    except requests.HTTPError:
-        raise
-    except Exception as file_error:
-        print(f"Error procesando {nombre_archivo}: {file_error}")
-        errors.append(FileError(archivo=nombre_archivo, error=str(file_error)))
+        sys.stdout.write(f"LOG de proceso subido a SharePoint: {log_url}\n")
+        sys.stdout.flush()
+    except Exception as log_error:
+        sys.stdout.write(f"No se pudo subir el LOG a SharePoint: {log_error}\n")
+        sys.stdout.flush()
 
-    csv_bytes = build_control_csv_bytes([transactions] if not transactions.empty else [])
-    uploaded_url = upload_control_csv(access_token, config, parent_path, csv_bytes, csv_name)
 
-    return ProcessResponse(
-        status="ok" if not errors else "ok_con_errores",
-        ruta_completa=ruta_completa,
-        ruta_limpia=clean_path,
-        nombre_archivo=nombre_archivo,
-        carpeta_fecha=carpeta_fecha,
-        csv_generado=csv_name,
-        transacciones_exportadas=len(transactions),
-        archivo_control=uploaded_url,
-        errores=errors,
-    )
+def procesar_egreso_background(ruta_completa: str) -> None:
+    """Ejecuta todo el flujo pesado en segundo plano y sube CSV + LOG a SharePoint."""
+    global _current_logs
+
+    log_event("Solicitud en cola. Esperando turno de procesamiento...")
+    with _process_lock:
+        _current_logs = []
+        access_token: Optional[str] = None
+        config: Optional[dict[str, str]] = None
+        parent_path: Optional[str] = None
+        nombre_archivo: Optional[str] = None
+
+        try:
+            log_event(
+                "Turno adquirido. Iniciando procesamiento en segundo plano: "
+                f"{ruta_completa}"
+            )
+            config = get_config()
+            access_token = get_access_token(config)
+            clean_path = normalize_graph_path(ruta_completa)
+            nombre_archivo = extract_file_name_from_path(clean_path)
+            carpeta_fecha = extract_parent_folder_from_path(clean_path)
+            parent_path = extract_parent_path_from_path(clean_path)
+            parent_folder = get_drive_item_by_path(access_token, config, parent_path)
+            csv_name = build_control_csv_name(nombre_archivo)
+            egreso_base_name = sanitize_folder_name(get_file_base_name(nombre_archivo))
+            transactions = pd.DataFrame(columns=PAD_COLUMNS)
+
+            try:
+                transactions = process_file(
+                    access_token,
+                    config,
+                    clean_path,
+                    nombre_archivo,
+                    parent_folder["id"],
+                    egreso_base_name,
+                    carpeta_fecha,
+                )
+            except Exception as file_error:
+                log_event(f"Error procesando {nombre_archivo}: {file_error}")
+
+            csv_bytes = build_control_csv_bytes(
+                [transactions] if not transactions.empty else []
+            )
+            uploaded_url = upload_control_csv(
+                access_token, config, parent_path, csv_bytes, csv_name
+            )
+            log_event(
+                "Proceso finalizado. "
+                f"Transacciones exportadas: {len(transactions)}; "
+                f"CSV de control: {uploaded_url}"
+            )
+        except Exception as error:
+            log_event(f"Error general procesando egresos: {error}")
+        finally:
+            log_lines = list(_current_logs or [])
+            upload_process_log(
+                access_token,
+                config,
+                parent_path,
+                nombre_archivo,
+                log_lines,
+            )
+            _current_logs = None
 
 
 @app.get("/health")
@@ -844,33 +932,28 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/v1/procesar-egresos", response_model=Union[ProcessResponse, IgnoredResponse])
-def procesar_egresos(request: EgresosRequest) -> Union[ProcessResponse, IgnoredResponse]:
-    try:
-        if not should_process_excel_path(request.ruta_completa):
-            print(f"Archivo ignorado para evitar bucle: {request.ruta_completa}")
-            return IgnoredResponse(
-                status="ignored",
-                message="El archivo no es un Excel, se ignora para evitar bucles",
-            )
-
-        print(
-            "Solicitud recibida para procesar egreso: "
-            f"{request.ruta_completa}"
+@app.post(
+    "/api/v1/procesar-egresos",
+    status_code=202,
+    response_model=Union[AcceptedResponse, IgnoredResponse],
+)
+def procesar_egresos(
+    request: EgresosRequest,
+    background_tasks: BackgroundTasks,
+) -> Union[AcceptedResponse, IgnoredResponse]:
+    if not should_process_excel_path(request.ruta_completa):
+        log_event(f"Archivo ignorado para evitar bucle: {request.ruta_completa}")
+        return IgnoredResponse(
+            status="ignored",
+            message="El archivo no es un Excel, se ignora para evitar bucles",
         )
-        print("Esperando turno en cola de procesamiento...")
-        with _process_lock:
-            print(
-                "Turno adquirido. Iniciando procesamiento por ruta de egreso: "
-                f"{request.ruta_completa}"
-            )
-            return run_egresos_process(request.ruta_completa)
-    except requests.HTTPError as http_error:
-        graph_response = http_error.response
-        status_code = graph_response.status_code if graph_response is not None else 500
-        detail = graph_response.text if graph_response is not None else str(http_error)
-        print(f"Error HTTP Graph: {detail}")
-        raise HTTPException(status_code=status_code, detail=detail) from http_error
-    except Exception as error:
-        print(f"Error general procesando egresos: {error}")
-        raise HTTPException(status_code=500, detail=str(error)) from error
+
+    log_event(
+        "Solicitud recibida para procesar egreso: "
+        f"{request.ruta_completa}"
+    )
+    background_tasks.add_task(procesar_egreso_background, request.ruta_completa)
+    return AcceptedResponse(
+        status="accepted",
+        message="Procesamiento en segundo plano iniciado",
+    )
