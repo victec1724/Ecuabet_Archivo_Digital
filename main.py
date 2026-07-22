@@ -1,6 +1,8 @@
 import io
 import os
 import re
+import threading
+import time
 import unicodedata
 from typing import Any, Optional, Union
 from urllib.parse import quote
@@ -21,7 +23,12 @@ GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 SUPPORTED_EXTENSIONS = (".xls", ".xlsx", ".csv")
 PAD_COLUMNS = ["EGR", "CODIGO_PROVEEDOR", "DETALLE", "DETALLE_COMPLETO"]
 CONTROL_CSV_PREFIX = "CSV_"
-DEFAULT_FACTURAS_BASE_PATH = "SPORTEK/2026/05 COMISIONES/5. XML FACTURAS/6. JUNIO"
+DEFAULT_FACTURAS_BASE_PATH = "SPORTEK/2026/05 COMISIONES/5. XML FACTURAS/7. JULIO"
+FACTURA_SEARCH_MAX_ATTEMPTS = 25
+FACTURA_SEARCH_RETRY_DELAY_SECONDS = int(
+    os.environ.get("GRAPH_FACTURA_SEARCH_RETRY_SECONDS", "10")
+)
+_process_lock = threading.Lock()
 
 app = FastAPI(
     title="Ecuabet RPA SharePoint Service",
@@ -526,29 +533,43 @@ def invoice_matches_provider(
     )
 
 
-def copiar_factura_pdf_proveedor(
-    access_token: str,
-    config: dict[str, str],
-    transaction: dict[str, Any],
-    destination_folder_id: str,
-) -> None:
-    provider_code = str(transaction.get("CODIGO_PROVEEDOR", "")).strip()
-    provider_name = str(transaction.get("DETALLE", "")).strip()
-    provider_label = f"{provider_code} {provider_name}".strip()
-    invoice_month_path = config["facturas_base_path"].rstrip("/")
-
-    invoice_items = list_pdf_items_recursive(access_token, config, invoice_month_path)
-    if not invoice_items:
-        print(f"Factura no encontrada para {provider_label}")
-        return
-
+def find_matching_invoice_item(
+    invoice_items: list[dict[str, Any]],
+    provider_code: str,
+    provider_name: str,
+) -> Optional[dict[str, Any]]:
     for item in invoice_items:
         pdf_name = item.get("name", "")
         if "file" not in item or not pdf_name.lower().endswith(".pdf"):
             continue
 
         if invoice_matches_provider(pdf_name, provider_code, provider_name):
-            pdf_bytes = download_drive_item_bytes(access_token, config, item["id"])
+            return item
+
+    return None
+
+
+def copiar_factura_pdf_proveedor(
+    access_token: str,
+    config: dict[str, str],
+    transaction: dict[str, Any],
+    destination_folder_id: str,
+) -> bool:
+    provider_code = str(transaction.get("CODIGO_PROVEEDOR", "")).strip()
+    provider_name = str(transaction.get("DETALLE", "")).strip()
+    provider_label = f"{provider_code} {provider_name}".strip()
+    invoice_month_path = config["facturas_base_path"].rstrip("/")
+
+    for attempt in range(1, FACTURA_SEARCH_MAX_ATTEMPTS + 1):
+        invoice_items = list_pdf_items_recursive(access_token, config, invoice_month_path)
+        matched_item = find_matching_invoice_item(
+            invoice_items,
+            provider_code,
+            provider_name,
+        )
+        if matched_item:
+            pdf_name = matched_item.get("name", "")
+            pdf_bytes = download_drive_item_bytes(access_token, config, matched_item["id"])
             uploaded_url = upload_bytes_to_folder(
                 access_token,
                 config,
@@ -557,10 +578,25 @@ def copiar_factura_pdf_proveedor(
                 pdf_bytes,
                 "application/pdf",
             )
-            print(f"Factura copiada para {provider_label}: {uploaded_url}")
-            return
+            print(
+                f"Factura copiada para {provider_label} "
+                f"(intento {attempt}/{FACTURA_SEARCH_MAX_ATTEMPTS}): {uploaded_url}"
+            )
+            return True
 
-    print(f"Factura no encontrada para {provider_label}")
+        if attempt < FACTURA_SEARCH_MAX_ATTEMPTS:
+            print(
+                f"Factura no encontrada para {provider_label} "
+                f"(intento {attempt}/{FACTURA_SEARCH_MAX_ATTEMPTS}); "
+                f"reintentando en {FACTURA_SEARCH_RETRY_DELAY_SECONDS}s..."
+            )
+            time.sleep(FACTURA_SEARCH_RETRY_DELAY_SECONDS)
+
+    print(
+        f"Factura no encontrada para {provider_label} "
+        f"tras {FACTURA_SEARCH_MAX_ATTEMPTS} intentos; se continua con la siguiente"
+    )
+    return False
 
 
 def find_child_folder(
@@ -648,9 +684,11 @@ def create_destination_hierarchy(
     unique_transactions = transactions.drop_duplicates(
         subset=["CODIGO_PROVEEDOR", "DETALLE"]
     )
-    print(f"Creando/validando carpetas FC unicas: {len(unique_transactions)}")
+    transaction_records = unique_transactions.to_dict("records")
+    print(f"Creando/validando carpetas FC unicas: {len(transaction_records)}")
 
-    for transaction in unique_transactions.to_dict("records"):
+    fc_destinations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for transaction in transaction_records:
         folder_name = f"FC {transaction['CODIGO_PROVEEDOR']} {transaction['DETALLE']}"
         fc_folder = ensure_folder(
             access_token,
@@ -659,6 +697,13 @@ def create_destination_hierarchy(
             folder_name,
             "Nivel 3 Factura Comisionista",
         )
+        fc_destinations.append((transaction, fc_folder))
+
+    print(
+        f"Carpetas FC listas. Iniciando copia de facturas con hasta "
+        f"{FACTURA_SEARCH_MAX_ATTEMPTS} intentos por proveedor"
+    )
+    for transaction, fc_folder in fc_destinations:
         copiar_factura_pdf_proveedor(
             access_token,
             config,
@@ -810,10 +855,16 @@ def procesar_egresos(request: EgresosRequest) -> Union[ProcessResponse, IgnoredR
             )
 
         print(
-            "Iniciando procesamiento por ruta de egreso: "
+            "Solicitud recibida para procesar egreso: "
             f"{request.ruta_completa}"
         )
-        return run_egresos_process(request.ruta_completa)
+        print("Esperando turno en cola de procesamiento...")
+        with _process_lock:
+            print(
+                "Turno adquirido. Iniciando procesamiento por ruta de egreso: "
+                f"{request.ruta_completa}"
+            )
+            return run_egresos_process(request.ruta_completa)
     except requests.HTTPError as http_error:
         graph_response = http_error.response
         status_code = graph_response.status_code if graph_response is not None else 500
